@@ -467,10 +467,20 @@ Scope:
 
         station_options = sorted({row.station_id for row in live_explorer_rows if row.station_id})
         selected_station = st.selectbox("StationID Filter", ["All"] + station_options)
+        limit_to_shadow_entries = st.checkbox(
+            "Only include entries found in shadow competition",
+            value=False,
+        )
 
         station_filtered_live_rows = live_explorer_rows
         if selected_station != "All":
             station_filtered_live_rows = [row for row in live_explorer_rows if row.station_id == selected_station]
+
+        shadow_entries = {row.entry_number for row in shadow_explorer_rows}
+        if limit_to_shadow_entries:
+            station_filtered_live_rows = [
+                row for row in station_filtered_live_rows if row.entry_number in shadow_entries
+            ]
 
         selected_live_entries = {row.entry_number for row in station_filtered_live_rows}
         station_filtered_shadow_rows = [
@@ -480,11 +490,15 @@ Scope:
         station_filtered_rows = station_filtered_live_rows + station_filtered_shadow_rows
 
         entry_options = sorted(
-            {row.entry_number for row in station_filtered_rows}, key=lambda x: int(x) if x.isdigit() else x
+            selected_live_entries,
+            key=lambda x: int(x) if x.isdigit() else x,
         )
 
         if not entry_options:
-            st.warning("No live entries are available for the selected StationID.")
+            if limit_to_shadow_entries:
+                st.warning("No live entries for this StationID were found in the shadow competition.")
+            else:
+                st.warning("No live entries are available for the selected StationID.")
         else:
             selected_entry = st.selectbox("Entry Number", entry_options)
             entry_rows = [row for row in station_filtered_rows if row.entry_number == selected_entry]

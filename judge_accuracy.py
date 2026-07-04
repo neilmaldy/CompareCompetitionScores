@@ -109,7 +109,7 @@ def judge_accuracy(reference_scores, judge_scores, deletion_weight=1.0, insertio
     alignment_cost = dp[m][n]
     normalized_error = alignment_cost / reference_total if reference_total > 0 else 1.0
     accuracy = max(0.0, 100.0 * (1.0 - normalized_error))
-    total_error_pct = abs(judge_total - reference_total) / reference_total * 100.0
+    total_error_pct = ((judge_total - reference_total) / reference_total * 100.0) if reference_total > 0 else 0.0
     exact_match_rate = (exact_matches / matched_count * 100.0) if matched_count > 0 else 0.0
 
     return {

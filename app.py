@@ -32,6 +32,7 @@ class ParsedJudgeRow:
     source: str
     event: str
     entry_number: str
+    station_id: str | None
     judge_type: str
     judge_id: str
     marks: list[float]
@@ -154,9 +155,9 @@ def parse_tsv(content: bytes, is_live: bool) -> tuple[list[ParsedJudgeRow], int]
             skipped_rows += 1
             continue
 
+        station_id = (row.get("StationID") or "").strip() or None
         assignment_code = None
         if is_live:
-            station_id = (row.get("StationID") or "").strip()
             if not station_id:
                 skipped_rows += 1
                 continue
@@ -167,6 +168,7 @@ def parse_tsv(content: bytes, is_live: bool) -> tuple[list[ParsedJudgeRow], int]
                 source="Live" if is_live else "Shadow",
                 event=event,
                 entry_number=entry_number,
+                station_id=station_id,
                 judge_type=judge_type,
                 judge_id=judge_id,
                 marks=marks,
@@ -457,102 +459,129 @@ Scope:
 
     st.subheader("Difficulty Timeline Explorer")
     explorer_rows = [row for row in (live_rows + shadow_rows) if row.judge_type in TARGET_JUDGE_TYPES]
-    entry_options = sorted({row.entry_number for row in explorer_rows}, key=lambda x: int(x) if x.isdigit() else x)
-
-    if not entry_options:
+    if not explorer_rows:
         st.warning("No D-type judge data found for the selected event filter.")
     else:
-        selected_entry = st.selectbox("Entry Number", entry_options)
-        entry_rows = [row for row in explorer_rows if row.entry_number == selected_entry]
+        live_explorer_rows = [row for row in explorer_rows if row.source == "Live"]
+        shadow_explorer_rows = [row for row in explorer_rows if row.source == "Shadow"]
 
-        available_types = sorted({row.judge_type for row in entry_rows})
-        valid_type_options = sorted({row.judge_type for row in entry_rows if row.marks})
-        unavailable_types = [jt for jt in available_types if jt not in valid_type_options]
+        station_options = sorted({row.station_id for row in live_explorer_rows if row.station_id})
+        selected_station = st.selectbox("StationID Filter", ["All"] + station_options)
 
-        if unavailable_types:
-            unavailable_text = ", ".join(f"{jt} (no valid marks)" for jt in unavailable_types)
-            st.info(f"Unavailable judge types for this entry: {unavailable_text}")
+        station_filtered_live_rows = live_explorer_rows
+        if selected_station != "All":
+            station_filtered_live_rows = [row for row in live_explorer_rows if row.station_id == selected_station]
 
-        if not valid_type_options:
-            st.warning("No valid D-type marks are available for this entry.")
+        selected_live_entries = {row.entry_number for row in station_filtered_live_rows}
+        station_filtered_shadow_rows = [
+            row for row in shadow_explorer_rows if row.entry_number in selected_live_entries
+        ]
+
+        station_filtered_rows = station_filtered_live_rows + station_filtered_shadow_rows
+
+        entry_options = sorted(
+            {row.entry_number for row in station_filtered_rows}, key=lambda x: int(x) if x.isdigit() else x
+        )
+
+        if not entry_options:
+            st.warning("No live entries are available for the selected StationID.")
         else:
-            selected_judge_type = st.selectbox("Judge Type", valid_type_options)
-            selected_rows = [row for row in entry_rows if row.judge_type == selected_judge_type]
+            selected_entry = st.selectbox("Entry Number", entry_options)
+            entry_rows = [row for row in station_filtered_rows if row.entry_number == selected_entry]
 
-            timeline_df = build_time_series_df(selected_rows)
-            if timeline_df.empty:
-                st.warning("No timestamped marks found for this entry/judge type.")
+            if not entry_rows:
+                st.warning("No difficulty rows are available for the selected StationID.")
             else:
-                st.caption("X-axis is seconds since each judge's first mark.")
-                marker_symbols = [
-                    "circle",
-                    "square",
-                    "triangle",
-                    "diamond",
-                    "cross",
-                    "star",
-                    "triangle-up",
-                    "triangle-down",
-                    "wedge",
-                    "arrow",
-                ]
-                judge_labels = sorted(timeline_df["JudgeLabel"].unique().tolist())
-                shape_map = {label: marker_symbols[idx % len(marker_symbols)] for idx, label in enumerate(judge_labels)}
-                timeline_df["MarkerShape"] = timeline_df["JudgeLabel"].map(shape_map)
+                available_types = sorted({row.judge_type for row in entry_rows})
+                valid_type_options = sorted({row.judge_type for row in entry_rows if row.marks})
+                unavailable_types = [jt for jt in available_types if jt not in valid_type_options]
 
-                base = alt.Chart(timeline_df).encode(
-                    x=alt.X("SecondsSinceFirstMark:Q", title="Seconds Since First Mark"),
-                    y=alt.Y("DifficultyLevel:Q", title="Difficulty Level"),
-                    color=alt.Color("JudgeLabel:N", title="Score Set"),
-                )
+                if unavailable_types:
+                    unavailable_text = ", ".join(f"{jt} (no valid marks)" for jt in unavailable_types)
+                    st.info(f"Unavailable judge types for this entry: {unavailable_text}")
 
-                dashed_trend = base.mark_line(strokeDash=[4, 4], opacity=0.28)
+                if not valid_type_options:
+                    st.warning("No valid D-type marks are available for this entry.")
+                else:
+                    selected_judge_type = st.selectbox("Judge Type", valid_type_options)
+                    selected_rows = [row for row in entry_rows if row.judge_type == selected_judge_type]
 
-                points = base.mark_point(size=90, filled=True).encode(
-                    shape=alt.Shape(
-                        "MarkerShape:N",
-                        title="Marker",
-                        scale=alt.Scale(domain=list(shape_map.values()), range=marker_symbols),
-                    ),
-                    tooltip=[
-                        alt.Tooltip("JudgeLabel:N", title="Score Set"),
-                        alt.Tooltip("Source:N", title="Source"),
-                        alt.Tooltip("MarkIndex:Q", title="Mark #"),
-                        alt.Tooltip("SecondsSinceFirstMark:Q", title="Seconds", format=".2f"),
-                        alt.Tooltip("DifficultyLevel:Q", title="Difficulty", format=".1f"),
-                    ],
-                )
+                    timeline_df = build_time_series_df(selected_rows)
+                    if timeline_df.empty:
+                        st.warning("No timestamped marks found for this entry/judge type.")
+                    else:
+                        st.caption("X-axis is seconds since each judge's first mark.")
+                        marker_symbols = [
+                            "circle",
+                            "square",
+                            "triangle",
+                            "diamond",
+                            "cross",
+                            "star",
+                            "triangle-up",
+                            "triangle-down",
+                            "wedge",
+                            "arrow",
+                        ]
+                        judge_labels = sorted(timeline_df["JudgeLabel"].unique().tolist())
+                        shape_map = {
+                            label: marker_symbols[idx % len(marker_symbols)] for idx, label in enumerate(judge_labels)
+                        }
+                        timeline_df["MarkerShape"] = timeline_df["JudgeLabel"].map(shape_map)
 
-                dot_plot = alt.layer(dashed_trend, points).properties(height=360)
-                st.altair_chart(dot_plot, width="stretch")
+                        base = alt.Chart(timeline_df).encode(
+                            x=alt.X("SecondsSinceFirstMark:Q", title="Seconds Since First Mark"),
+                            y=alt.Y("DifficultyLevel:Q", title="Difficulty Level"),
+                            color=alt.Color("JudgeLabel:N", title="Score Set"),
+                        )
 
-            live_selected = [row for row in selected_rows if row.source == "Live"]
-            shadow_selected = [row for row in selected_rows if row.source == "Shadow"]
+                        dashed_trend = base.mark_line(strokeDash=[4, 4], opacity=0.28)
 
-            shadow_first_match = first_valid_row(shadow_selected)
-            reference_label = ""
-            reference_score: float | None = None
+                        points = base.mark_point(size=90, filled=True).encode(
+                            shape=alt.Shape(
+                                "MarkerShape:N",
+                                title="Marker",
+                                scale=alt.Scale(domain=list(shape_map.values()), range=marker_symbols),
+                            ),
+                            tooltip=[
+                                alt.Tooltip("JudgeLabel:N", title="Score Set"),
+                                alt.Tooltip("Source:N", title="Source"),
+                                alt.Tooltip("MarkIndex:Q", title="Mark #"),
+                                alt.Tooltip("SecondsSinceFirstMark:Q", title="Seconds", format=".2f"),
+                                alt.Tooltip("DifficultyLevel:Q", title="Difficulty", format=".1f"),
+                            ],
+                        )
 
-            if shadow_first_match is not None:
-                reference_score = calculate_difficulty_score(shadow_first_match.marks)
-                reference_label = "Shadow first-match reference score"
-            else:
-                live_scores = [calculate_difficulty_score(row.marks) for row in live_selected if row.marks]
-                reference_score = ijru_average(live_scores)
-                reference_label = "IJRU 4.2 averaged live reference score"
+                        dot_plot = alt.layer(dashed_trend, points).properties(height=360)
+                        st.altair_chart(dot_plot, width="stretch")
 
-            if reference_score is not None:
-                st.caption(f"Reference source: {reference_label}")
-                st.metric(reference_label, round(reference_score, 4))
-            else:
-                st.warning("Reference score is unavailable for this selection.")
+                    live_selected = [row for row in selected_rows if row.source == "Live"]
+                    shadow_selected = [row for row in selected_rows if row.source == "Shadow"]
 
-            st.subheader("Calculated Judge Scores")
-            score_df = build_score_table(selected_rows, reference_score)
-            if score_df.empty:
-                st.info("No judge scores available for this selection.")
-            else:
-                st.dataframe(score_df, width="stretch")
+                    shadow_first_match = first_valid_row(shadow_selected)
+                    reference_label = ""
+                    reference_score: float | None = None
+
+                    if shadow_first_match is not None:
+                        reference_score = calculate_difficulty_score(shadow_first_match.marks)
+                        reference_label = "Shadow first-match reference score"
+                    else:
+                        live_scores = [calculate_difficulty_score(row.marks) for row in live_selected if row.marks]
+                        reference_score = ijru_average(live_scores)
+                        reference_label = "IJRU 4.2 averaged live reference score"
+
+                    if reference_score is not None:
+                        st.caption(f"Reference source: {reference_label}")
+                        st.metric(reference_label, round(reference_score, 4))
+                    else:
+                        st.warning("Reference score is unavailable for this selection.")
+
+                    st.subheader("Calculated Judge Scores")
+                    score_df = build_score_table(selected_rows, reference_score)
+                    if score_df.empty:
+                        st.info("No judge scores available for this selection.")
+                    else:
+                        st.dataframe(score_df, width="stretch")
 
     if details_df.empty:
         st.warning("No comparable rows found after filtering and matching.")

@@ -5,10 +5,11 @@ import zipfile
 from dataclasses import dataclass
 from typing import Any
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
-from judge_accuracy import judge_accuracy
+from judge_accuracy import LEVEL_POINTS, judge_accuracy
 
 TARGET_EVENTS = {"SRIF", "SRPF", "SRTF"}
 TARGET_JUDGE_TYPES = {"Dm", "Dr", "Dp"}
@@ -28,11 +29,13 @@ MARK_MAP = {
 
 @dataclass
 class ParsedJudgeRow:
+    source: str
     event: str
     entry_number: str
     judge_type: str
     judge_id: str
     marks: list[float]
+    mark_events: list[tuple[int, float]]
     assignment_code: str | None = None
 
 
@@ -48,14 +51,27 @@ def parse_payload(raw: str) -> dict[str, Any] | None:
         return None
 
 
-def extract_marks(payload: dict[str, Any]) -> list[float] | None:
+def _coerce_timestamp(raw_timestamp: Any) -> int:
+    if isinstance(raw_timestamp, int):
+        return raw_timestamp
+    if isinstance(raw_timestamp, float):
+        return int(raw_timestamp)
+    if isinstance(raw_timestamp, str):
+        try:
+            return int(float(raw_timestamp))
+        except ValueError:
+            return 0
+    return 0
+
+
+def extract_marks(payload: dict[str, Any]) -> tuple[list[float] | None, list[tuple[int, float]] | None]:
     mark_sheet = payload.get("MarkSheet")
     if not isinstance(mark_sheet, dict):
-        return None
+        return None, None
 
     marks = mark_sheet.get("marks")
     if not isinstance(marks, list):
-        return None
+        return None, None
 
     # Use sequence first, then timestamp as tie-breaker to preserve intended order.
     sorted_marks = sorted(
@@ -67,17 +83,25 @@ def extract_marks(payload: dict[str, Any]) -> list[float] | None:
     )
 
     sequence: list[float] = []
+    mark_events: list[tuple[int, float]] = []
     for mark in sorted_marks:
         if not isinstance(mark, dict):
             continue
         schema = mark.get("schema")
         if schema in MARK_MAP:
-            sequence.append(MARK_MAP[schema])
+            level = MARK_MAP[schema]
+            sequence.append(level)
+            mark_events.append((_coerce_timestamp(mark.get("timestamp")), level))
         elif schema == "undo":
             if sequence:
                 sequence.pop()
+            if mark_events:
+                mark_events.pop()
+        elif schema == "clear":
+            sequence.clear()
+            mark_events.clear()
 
-    return sequence
+    return sequence, mark_events
 
 
 def extract_judge_meta(payload: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -115,10 +139,10 @@ def parse_tsv(content: bytes, is_live: bool) -> tuple[list[ParsedJudgeRow], int]
             skipped_rows += 1
             continue
 
-        marks = extract_marks(payload)
+        marks, mark_events = extract_marks(payload)
         judge_id, judge_type = extract_judge_meta(payload)
 
-        if marks is None or judge_id is None or judge_type is None:
+        if marks is None or mark_events is None or judge_id is None or judge_type is None:
             skipped_rows += 1
             continue
 
@@ -140,11 +164,13 @@ def parse_tsv(content: bytes, is_live: bool) -> tuple[list[ParsedJudgeRow], int]
 
         parsed_rows.append(
             ParsedJudgeRow(
+                source="Live" if is_live else "Shadow",
                 event=event,
                 entry_number=entry_number,
                 judge_type=judge_type,
                 judge_id=judge_id,
                 marks=marks,
+                mark_events=mark_events,
                 assignment_code=assignment_code,
             )
         )
@@ -271,6 +297,95 @@ def build_excel(details_df: pd.DataFrame, ranking_df: pd.DataFrame) -> bytes:
     return buffer.read()
 
 
+def calculate_difficulty_score(mark_levels: list[float]) -> float:
+    return sum(LEVEL_POINTS[level] for level in mark_levels if level in LEVEL_POINTS)
+
+
+def ijru_average(scores: list[float]) -> float | None:
+    if not scores:
+        return None
+    if len(scores) == 1:
+        return scores[0]
+    if len(scores) == 2:
+        return sum(scores) / 2
+    if len(scores) == 3:
+        ordered = sorted(scores)
+        low, mid, high = ordered
+        low_gap = mid - low
+        high_gap = high - mid
+        if low_gap < high_gap:
+            return (low + mid) / 2
+        # In a tie, athlete benefit applies: average the two higher scores.
+        return (mid + high) / 2
+
+    ordered = sorted(scores)
+    trimmed = ordered[1:-1]
+    if not trimmed:
+        return None
+    return sum(trimmed) / len(trimmed)
+
+
+def build_time_series_df(rows: list[ParsedJudgeRow]) -> pd.DataFrame:
+    points: list[dict[str, Any]] = []
+
+    for row in rows:
+        if not row.mark_events:
+            continue
+
+        first_ts = min(ts for ts, _ in row.mark_events)
+        label_suffix = row.assignment_code if row.source == "Live" else f"S-{row.judge_id}"
+        judge_label = f"{row.source} {label_suffix}"
+
+        for idx, (ts, level) in enumerate(row.mark_events, start=1):
+            seconds_since_first = (ts - first_ts) / 1000.0
+            points.append(
+                {
+                    "EntryNumber": row.entry_number,
+                    "JudgeTypeID": row.judge_type,
+                    "JudgeLabel": judge_label,
+                    "Source": row.source,
+                    "MarkIndex": idx,
+                    "SecondsSinceFirstMark": round(max(0.0, seconds_since_first), 3),
+                    "DifficultyLevel": level,
+                }
+            )
+
+    return pd.DataFrame(points)
+
+
+def build_score_table(rows: list[ParsedJudgeRow], reference_score: float | None) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+
+    for row in rows:
+        calculated = calculate_difficulty_score(row.marks)
+        judge_label = row.assignment_code if row.source == "Live" else f"Shadow-{row.judge_id}"
+
+        pct_diff = None
+        if reference_score is not None and reference_score != 0:
+            pct_diff = (calculated - reference_score) / reference_score * 100.0
+
+        records.append(
+            {
+                "Source": row.source,
+                "Judge": judge_label,
+                "JudgeID": row.judge_id,
+                "CalculatedDifficultyScore": round(calculated, 4),
+                "MarkCount": len(row.marks),
+                "ReferenceScore": round(reference_score, 4) if reference_score is not None else None,
+                "PercentDifferenceVsReference": round(pct_diff, 4) if pct_diff is not None else None,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def first_valid_row(rows: list[ParsedJudgeRow]) -> ParsedJudgeRow | None:
+    for row in rows:
+        if row.marks:
+            return row
+    return None
+
+
 def main() -> None:
     st.set_page_config(page_title="AMJRF Judge Accuracy", layout="wide")
     st.title("AMJRF Judge Accuracy Check")
@@ -293,50 +408,169 @@ Scope:
     with col2:
         shadow_file = st.file_uploader("Shadow TSV or ZIP", type=["tsv", "zip"], key="shadow")
 
-    if not live_file or not shadow_file:
-        st.info("Upload both TSV files to run analysis.")
+    if not live_file:
+        st.info("Upload a live TSV/ZIP to begin. Upload shadow TSV/ZIP for side-by-side comparison.")
         return
 
     if st.button("Run Analysis", type="primary"):
         live_bytes = get_tsv_bytes_from_upload(live_file, "Live")
-        shadow_bytes = get_tsv_bytes_from_upload(shadow_file, "Shadow")
+        shadow_bytes = get_tsv_bytes_from_upload(shadow_file, "Shadow") if shadow_file else None
 
-        if live_bytes is None or shadow_bytes is None:
+        if live_bytes is None:
             return
 
         live_rows, live_skipped = parse_tsv(live_bytes, is_live=True)
-        shadow_rows, shadow_skipped = parse_tsv(shadow_bytes, is_live=False)
+        shadow_rows: list[ParsedJudgeRow] = []
+        shadow_skipped = 0
+        if shadow_bytes is not None:
+            shadow_rows, shadow_skipped = parse_tsv(shadow_bytes, is_live=False)
 
-        shadow_reference = build_shadow_reference(shadow_rows)
-        details_df = compare_rows(live_rows, shadow_reference)
-        ranking_df = build_ranking(details_df)
+        st.session_state["analysis_data"] = {
+            "live_rows": live_rows,
+            "shadow_rows": shadow_rows,
+            "live_skipped": live_skipped,
+            "shadow_skipped": shadow_skipped,
+        }
 
-        st.subheader("Summary")
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Parsed Live Rows", len(live_rows))
-        s2.metric("Parsed Shadow Rows", len(shadow_rows))
-        s3.metric("Compared Rows", len(details_df))
-        s4.metric("Unique Ranked Judges", len(ranking_df))
+    analysis_data = st.session_state.get("analysis_data")
+    if analysis_data is None:
+        st.info("Click 'Run Analysis' to parse uploaded files.")
+        return
 
-        st.caption(f"Skipped rows during parse: live={live_skipped}, shadow={shadow_skipped}")
+    live_rows: list[ParsedJudgeRow] = analysis_data["live_rows"]
+    shadow_rows: list[ParsedJudgeRow] = analysis_data["shadow_rows"]
+    live_skipped: int = analysis_data["live_skipped"]
+    shadow_skipped: int = analysis_data["shadow_skipped"]
 
-        if details_df.empty:
-            st.warning("No comparable rows found after filtering and matching.")
-            return
+    shadow_reference = build_shadow_reference(shadow_rows)
+    details_df = compare_rows(live_rows, shadow_reference)
+    ranking_df = build_ranking(details_df)
 
-        st.subheader("Judge Accuracy Details")
-        st.dataframe(details_df, width="stretch")
+    st.subheader("Summary")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Parsed Live Rows", len(live_rows))
+    s2.metric("Parsed Shadow Rows", len(shadow_rows))
+    s3.metric("Compared Rows", len(details_df))
+    s4.metric("Unique Ranked Judges", len(ranking_df))
 
-        st.subheader("Judge Ranking")
-        st.dataframe(ranking_df, width="stretch")
+    st.caption(f"Skipped rows during parse: live={live_skipped}, shadow={shadow_skipped}")
 
-        excel_bytes = build_excel(details_df, ranking_df)
-        st.download_button(
-            label="Download Excel Report",
-            data=excel_bytes,
-            file_name="amjrf_judge_accuracy_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    st.subheader("Difficulty Timeline Explorer")
+    explorer_rows = [row for row in (live_rows + shadow_rows) if row.judge_type in TARGET_JUDGE_TYPES]
+    entry_options = sorted({row.entry_number for row in explorer_rows}, key=lambda x: int(x) if x.isdigit() else x)
+
+    if not entry_options:
+        st.warning("No D-type judge data found for the selected event filter.")
+    else:
+        selected_entry = st.selectbox("Entry Number", entry_options)
+        entry_rows = [row for row in explorer_rows if row.entry_number == selected_entry]
+
+        available_types = sorted({row.judge_type for row in entry_rows})
+        valid_type_options = sorted({row.judge_type for row in entry_rows if row.marks})
+        unavailable_types = [jt for jt in available_types if jt not in valid_type_options]
+
+        if unavailable_types:
+            unavailable_text = ", ".join(f"{jt} (no valid marks)" for jt in unavailable_types)
+            st.info(f"Unavailable judge types for this entry: {unavailable_text}")
+
+        if not valid_type_options:
+            st.warning("No valid D-type marks are available for this entry.")
+        else:
+            selected_judge_type = st.selectbox("Judge Type", valid_type_options)
+            selected_rows = [row for row in entry_rows if row.judge_type == selected_judge_type]
+
+            timeline_df = build_time_series_df(selected_rows)
+            if timeline_df.empty:
+                st.warning("No timestamped marks found for this entry/judge type.")
+            else:
+                st.caption("X-axis is seconds since each judge's first mark.")
+                marker_symbols = [
+                    "circle",
+                    "square",
+                    "triangle",
+                    "diamond",
+                    "cross",
+                    "star",
+                    "triangle-up",
+                    "triangle-down",
+                    "wedge",
+                    "arrow",
+                ]
+                judge_labels = sorted(timeline_df["JudgeLabel"].unique().tolist())
+                shape_map = {label: marker_symbols[idx % len(marker_symbols)] for idx, label in enumerate(judge_labels)}
+                timeline_df["MarkerShape"] = timeline_df["JudgeLabel"].map(shape_map)
+
+                base = alt.Chart(timeline_df).encode(
+                    x=alt.X("SecondsSinceFirstMark:Q", title="Seconds Since First Mark"),
+                    y=alt.Y("DifficultyLevel:Q", title="Difficulty Level"),
+                    color=alt.Color("JudgeLabel:N", title="Score Set"),
+                )
+
+                dashed_trend = base.mark_line(strokeDash=[4, 4], opacity=0.28)
+
+                points = base.mark_point(size=90, filled=True).encode(
+                    shape=alt.Shape(
+                        "MarkerShape:N",
+                        title="Marker",
+                        scale=alt.Scale(domain=list(shape_map.values()), range=marker_symbols),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("JudgeLabel:N", title="Score Set"),
+                        alt.Tooltip("Source:N", title="Source"),
+                        alt.Tooltip("MarkIndex:Q", title="Mark #"),
+                        alt.Tooltip("SecondsSinceFirstMark:Q", title="Seconds", format=".2f"),
+                        alt.Tooltip("DifficultyLevel:Q", title="Difficulty", format=".1f"),
+                    ],
+                )
+
+                dot_plot = alt.layer(dashed_trend, points).properties(height=360)
+                st.altair_chart(dot_plot, width="stretch")
+
+            live_selected = [row for row in selected_rows if row.source == "Live"]
+            shadow_selected = [row for row in selected_rows if row.source == "Shadow"]
+
+            shadow_first_match = first_valid_row(shadow_selected)
+            reference_label = ""
+            reference_score: float | None = None
+
+            if shadow_first_match is not None:
+                reference_score = calculate_difficulty_score(shadow_first_match.marks)
+                reference_label = "Shadow first-match reference score"
+            else:
+                live_scores = [calculate_difficulty_score(row.marks) for row in live_selected if row.marks]
+                reference_score = ijru_average(live_scores)
+                reference_label = "IJRU 4.2 averaged live reference score"
+
+            if reference_score is not None:
+                st.caption(f"Reference source: {reference_label}")
+                st.metric(reference_label, round(reference_score, 4))
+            else:
+                st.warning("Reference score is unavailable for this selection.")
+
+            st.subheader("Calculated Judge Scores")
+            score_df = build_score_table(selected_rows, reference_score)
+            if score_df.empty:
+                st.info("No judge scores available for this selection.")
+            else:
+                st.dataframe(score_df, width="stretch")
+
+    if details_df.empty:
+        st.warning("No comparable rows found after filtering and matching.")
+        return
+
+    st.subheader("Judge Accuracy Details")
+    st.dataframe(details_df, width="stretch")
+
+    st.subheader("Judge Ranking")
+    st.dataframe(ranking_df, width="stretch")
+
+    excel_bytes = build_excel(details_df, ranking_df)
+    st.download_button(
+        label="Download Excel Report",
+        data=excel_bytes,
+        file_name="amjrf_judge_accuracy_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 if __name__ == "__main__":

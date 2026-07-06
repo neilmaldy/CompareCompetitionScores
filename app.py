@@ -117,22 +117,29 @@ def extract_marks(payload: dict[str, Any]) -> tuple[list[float] | None, list[tup
 
     sequence: list[float] = []
     mark_events: list[tuple[int, float]] = []
+    previous_was_difficulty_mark = False
     for mark in sorted_marks:
         if not isinstance(mark, dict):
+            previous_was_difficulty_mark = False
             continue
         schema = mark.get("schema")
         if schema in MARK_MAP:
             level = MARK_MAP[schema]
             sequence.append(level)
             mark_events.append((_coerce_timestamp(mark.get("timestamp")), level))
+            previous_was_difficulty_mark = True
         elif schema == "undo":
-            if sequence:
+            if previous_was_difficulty_mark and sequence:
                 sequence.pop()
-            if mark_events:
+            if previous_was_difficulty_mark and mark_events:
                 mark_events.pop()
+            previous_was_difficulty_mark = False
         elif schema == "clear":
             sequence.clear()
             mark_events.clear()
+            previous_was_difficulty_mark = False
+        else:
+            previous_was_difficulty_mark = False
 
     return sequence, mark_events
 
@@ -175,18 +182,25 @@ def extract_break_marks(payload: dict[str, Any]) -> tuple[list[int] | None, list
     )
 
     break_timestamps: list[int] = []
+    previous_was_break_mark = False
     for mark in sorted_marks:
         if not isinstance(mark, dict):
+            previous_was_break_mark = False
             continue
 
         schema = mark.get("schema")
         if schema == BREAK_MARK_SCHEMA:
             break_timestamps.append(_coerce_timestamp(mark.get("timestamp")))
+            previous_was_break_mark = True
         elif schema == "undo":
-            if break_timestamps:
+            if previous_was_break_mark and break_timestamps:
                 break_timestamps.pop()
+            previous_was_break_mark = False
         elif schema == "clear":
             break_timestamps.clear()
+            previous_was_break_mark = False
+        else:
+            previous_was_break_mark = False
 
     break_events = [(ts, idx) for idx, ts in enumerate(break_timestamps, start=1)]
     return break_timestamps, break_events
@@ -225,18 +239,25 @@ def extract_miss_marks(payload: dict[str, Any]) -> tuple[list[int] | None, list[
     )
 
     miss_timestamps: list[int] = []
+    previous_was_miss_mark = False
     for mark in sorted_marks:
         if not isinstance(mark, dict):
+            previous_was_miss_mark = False
             continue
 
         schema = mark.get("schema")
         if schema == MISS_MARK_SCHEMA:
             miss_timestamps.append(_coerce_timestamp(mark.get("timestamp")))
+            previous_was_miss_mark = True
         elif schema == "undo":
-            if miss_timestamps:
+            if previous_was_miss_mark and miss_timestamps:
                 miss_timestamps.pop()
+            previous_was_miss_mark = False
         elif schema == "clear":
             miss_timestamps.clear()
+            previous_was_miss_mark = False
+        else:
+            previous_was_miss_mark = False
 
     miss_events = [(ts, idx) for idx, ts in enumerate(miss_timestamps, start=1)]
     return miss_timestamps, miss_events
@@ -1216,6 +1237,11 @@ Scope:
                 st.warning("No live miss-judge entries are available for the selected StationID.")
         else:
             selected_entry = st.selectbox("Entry Number", live_entries, key="misses_entry")
+            graph_source = st.selectbox(
+                "Graph Score Sets",
+                ["Both live and shadow", "Live only", "Shadow only"],
+                key="misses_graph_source",
+            )
 
             entry_live_rows = [row for row in filtered_live_miss_rows if row.entry_number == selected_entry]
             entry_shadow_rows = [
@@ -1223,7 +1249,12 @@ Scope:
                 for (entry_number, _judge_type), row in shadow_miss_graph_reference.items()
                 if entry_number == selected_entry
             ]
-            entry_rows_for_chart = entry_live_rows + entry_shadow_rows
+            if graph_source == "Live only":
+                entry_rows_for_chart = entry_live_rows
+            elif graph_source == "Shadow only":
+                entry_rows_for_chart = entry_shadow_rows
+            else:
+                entry_rows_for_chart = entry_live_rows + entry_shadow_rows
 
             chart_df = build_miss_time_series_df(entry_rows_for_chart)
             if chart_df.empty:
@@ -1395,7 +1426,17 @@ Scope:
                         st.warning("No valid D-type marks are available for this entry.")
                     else:
                         selected_judge_type = st.selectbox("Judge Type", valid_type_options)
+                        graph_source = st.selectbox(
+                            "Graph Score Sets",
+                            ["Both live and shadow", "Live only", "Shadow only"],
+                            key="difficulty_graph_source",
+                        )
                         selected_rows = [row for row in entry_rows if row.judge_type == selected_judge_type]
+
+                        if graph_source == "Live only":
+                            selected_rows = [row for row in selected_rows if row.source == "Live"]
+                        elif graph_source == "Shadow only":
+                            selected_rows = [row for row in selected_rows if row.source == "Shadow"]
 
                         timeline_df = build_time_series_df(selected_rows)
                         if timeline_df.empty:
@@ -1563,10 +1604,20 @@ Scope:
                 st.warning("No live technical-judge entries are available for the selected StationID.")
         else:
             selected_entry = st.selectbox("Entry Number", live_entries, key="breaks_entry")
+            graph_source = st.selectbox(
+                "Graph Score Sets",
+                ["Both live and shadow", "Live only", "Shadow only"],
+                key="breaks_graph_source",
+            )
 
             entry_live_rows = [row for row in filtered_live_break_rows if row.entry_number == selected_entry]
             entry_shadow_rows = [row for row in shadow_break_rows if row.entry_number == selected_entry]
-            entry_rows_for_chart = entry_live_rows + entry_shadow_rows
+            if graph_source == "Live only":
+                entry_rows_for_chart = entry_live_rows
+            elif graph_source == "Shadow only":
+                entry_rows_for_chart = entry_shadow_rows
+            else:
+                entry_rows_for_chart = entry_live_rows + entry_shadow_rows
 
             chart_df = build_break_time_series_df(entry_rows_for_chart)
             if chart_df.empty:
